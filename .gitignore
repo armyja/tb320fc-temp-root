@@ -10,3 +10,6 @@ build/
 # 本地分析临时文件
 ghostlock-app/
 *.log
+
+# 签名中间产物
+*.idsig
