@@ -8,7 +8,7 @@
 - App 源码：`app/`（纯 Java，不用 Gradle，`aapt2 + javac + d8 + apksigner` 直接出包）
 - 设备适配参数：`profile/`（HOCON + 打包脚本）
 - 对上游 GhostLock 的改动：`native/patches/`
-- 预编译 App：`dist/tb320fc-ghostroot-v4.apk`
+- 预编译 App：`dist/tb320fc-ghostroot-v5.apk`
 
 ---
 
@@ -41,7 +41,7 @@ KernelSU 以 LKM 方式 late-load），重启后完全消失。
 ### 方式 A：装 App（推荐）
 
 ```sh
-adb install -r dist/tb320fc-ghostroot-v4.apk
+adb install -r dist/tb320fc-ghostroot-v5.apk
 ```
 
 1. 先让 **Shizuku** 跑起来（App 内「通过无线调试启动」，或用 adb 拉起 `libshizuku.so`）；

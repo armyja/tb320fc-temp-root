@@ -79,6 +79,22 @@
 - **修法**：字面 `%` 全部写成 `%%`；并加自检：脚本看起来不对劲时打印
   `root script malformed (n=…)`，这类静默崩溃不会再出现。
 
+## 坑 9（App v5）：`/data/local/tmp` 里的文件"大小对、内容全是 0"
+
+- **现象**：以前能用，某天开始**每次点都失败**，而且失败得很快（秒退），设备不断重启。
+- **定位**：
+  - `md5sum /data/local/tmp/profile.bin` 与 APK 里的 `assets/profile.bin` 对不上；
+  - 更直接：`xxd /data/local/tmp/profile.bin | head -1`，**magic `0x0D000721` 变成 0**；
+  - 文件长度是对的（1921 / 724504 字节），只有内容是 0。
+- **根因**：这些文件是在**硬崩溃/panic 重启前**写的，数据还在页缓存没落盘，重启后就成了
+  "长度正确、内容为零"的空洞文件。而旧版 App **只校验大小**，坏文件能通过检查 →
+  exploit 一启动就 `cannot load profile` 秒退 → 判失败 → 重启，形成"每次都失败"。
+- **修法（v5）**：推送后强制 `/system/bin/sync`；校验从"比大小"改成 **md5**；
+  校验失败会删掉坏文件并报 `上次写入可能被重启丢掉了`，不会再拿坏文件去跑。
+
+> 手动排查/修复：`adb push` 一份干净的 `assets/ghostlock-dev` 与 `assets/profile.bin`
+> 到 `/data/local/tmp/`，`adb shell sync`，再用 `md5sum` 对比。
+
 ---
 
 ## 症状 → 处理 速查
@@ -91,6 +107,8 @@
 | `本次失败：进入竞态但没写成` | 竞态输了 | 正常，会自动重启继续 |
 | `本次失败：超时（竞态卡住）` | 内核被卡住 | 自动重启继续 |
 | `推送 ghostlock-dev 大小不符` | 传输被截断 | 重试；仍失败把日志发出来 |
+| `校验失败（… 期望 …）` | 推送的文件内容坏了（多半是上次重启丢了写回） | 自动删坏文件；**再点一次**即可重推 |
+| `cannot load profile` | profile 文件坏了（magic 被清零） | 同上，重跑 App 会重推并校验 |
 | `heap spray failed` | 内存泄漏没命中 | 检查 `mm_struct_sz` 是否为 960、`collisions` 是否为 4 |
 | `PI route did not produce a verified write` | 路由没写成 | 检查 `waiter_shift` 是否为 −2、`compact_waiter=1` |
 | `已经连续尝试 8 次` | 到上限 | 稍后再试；把 `ghostroot.log` 发出来一起看 |

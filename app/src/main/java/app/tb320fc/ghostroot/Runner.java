@@ -133,9 +133,11 @@ public final class Runner {
     private static boolean pushAsset(Context ctx, String asset, String dest, boolean exec, Listener l) {
         AssetManager am = ctx.getAssets();
         long expect;
+        String expectMd5;
         IRemoteProcess p = null;
         try {
             expect = assetSize(am, asset);
+            expectMd5 = assetMd5(am, asset);
             p = sh("/system/bin/cat > " + dest + ".tmp && /system/bin/chmod 755 " + dest + ".tmp"
                     + " && /system/bin/mv " + dest + ".tmp " + dest
                     + (exec ? "" : " && /system/bin/chmod 644 " + dest));
@@ -153,13 +155,20 @@ public final class Runner {
                 if (l != null) l.onLog("[app] " + lastFailure);
                 return false;
             }
-            String size = runForOutput("/system/bin/stat -c %s " + dest, 5000);
-            if (!size.isEmpty() && !size.equals(String.valueOf(expect))) {
-                lastFailure = asset + " 大小不符：期望 " + expect + " 实际 " + size;
+            /* 只比大小是不够的：硬重启丢写回会留下"长度正确、内容全 0"的文件。
+             * 所以这里 (1) 落盘 sync，(2) 比 md5。 */
+            runForOutput("/system/bin/sync", 8000);
+            String sum = runForOutput("/system/bin/md5sum " + dest, 8000).trim();
+            String got = sum.isEmpty() ? "" : sum.split("\\s+")[0];
+            if (!got.equalsIgnoreCase(expectMd5)) {
+                lastFailure = asset + " 校验失败（设备 " + (got.isEmpty() ? "读不到" : got)
+                        + " / 期望 " + expectMd5 + "），上次写入可能被重启丢掉了";
                 if (l != null) l.onLog("[app] " + lastFailure);
+                // 删除坏文件，避免下次误用
+                runForOutput("/system/bin/rm -f " + dest, 5000);
                 return false;
             }
-            if (l != null) l.onLog("[app] 已推送 " + asset + " (" + expect + " B)");
+            if (l != null) l.onLog("[app] 已推送 " + asset + " (" + expect + " B, md5 " + got + ")");
             return true;
         } catch (Throwable t) {
             lastFailure = "推送 " + asset + " 失败: " + t;
@@ -172,6 +181,20 @@ public final class Runner {
                 } catch (Throwable ignored) {
                 }
             }
+        }
+    }
+
+    private static String assetMd5(AssetManager am, String asset) {
+        try (InputStream is = am.open(asset)) {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = is.read(buf)) > 0) md.update(buf, 0, n);
+            StringBuilder sb = new StringBuilder();
+            for (byte b : md.digest()) sb.append(String.format("%02x", b & 0xff));
+            return sb.toString();
+        } catch (Throwable t) {
+            return "";
         }
     }
 
