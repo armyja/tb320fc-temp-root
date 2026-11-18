@@ -80,6 +80,14 @@ adb install -r app/tb320fc-ghostroot.apk
 # 装完打开 App，应显示：未 root / KernelSU 模块：未加载 / 内核：5.10.209-…
 ```
 
+## 4.5 签名一致性（重要）
+
+`app/build.sh` 在没有 `ghostroot.keystore` 时会生成一个新的，**签名和 Release 里的 APK 不同**，
+覆盖安装会失败（`INSTALL_FAILED_UPDATE_INCOMPATIBLE`）。所以：
+
+- 维护者请把 `ghostroot.keystore` 存在**仓库之外**（例如 `~/.keys/`），构建时先拷回 `app/`；
+- 或者发布新版本前先 `adb uninstall app.tb320fc.ghostroot`（会清 App 数据）再装新的。
+
 ## 5. 发布新版本
 
 1. `dist/tb320fc-ghostroot-vX.apk` 更新；
